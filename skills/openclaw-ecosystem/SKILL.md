@@ -6,11 +6,49 @@ version: 1.0
 
 # OpenClaw Ecosystem — Audit & Maintenance
 
+## Migration Status (Apr 27 2026) — COMPLETE ✅
+
+OpenClaw gateway and claude-mem-worker are **STOPPED and DISABLED**. Hermes operates fully independently.
+
+| What | Hermes Replacement | Status |
+|------|-------------------|--------|
+| Telegram bot (@anastasialeadbot) | @shostka_help_bot (Hermes bot) | ✅ Active (21 commands) |
+| MCP servers (analytics, meta-ads, wazzup24) | Same systemd services | ✅ Independent |
+| amocrm MCP | In Hermes config (patched version, stdio) | ✅ Active |
+| context7 MCP | In Hermes config (npx) | ✅ Active |
+| tolaria MCP (Obsidian) | In Hermes config (node) | ✅ Active |
+| claude-mem (vector memory) | Hermes MEMORY.md + session_search | ✅ Replaced |
+| openclaw-web-search | Hermes web toolset | ✅ Replaced |
+| Cron tasks (8 jobs) | System crontab | ✅ Independent |
+| Streamlit dashboard (:8501) | Standalone systemd | ✅ Running |
+| AX2 PHP dashboard (:8080) | Standalone | ✅ Running |
+| FileBrowser (:8090) | Systemd + nginx proxy | ✅ Running |
+
+### If re-enabling is ever needed:
+```bash
+systemctl enable openclaw-gateway && systemctl start openclaw-gateway
+systemctl enable claude-mem-worker && systemctl start claude-mem-worker
+```
+
+### Service Migration Audit Methodology (reusable pattern):
+1. **Map dependencies:** grep all scripts/configs for references to the service
+2. **Identify independent components:** MCP servers run as separate systemd services, not spawned by gateway
+3. **Update monitoring scripts:** Remove the service from health-check arrays in automation_watcher.sh, daily_report.sh, task_watchdog.sh
+4. **Update restart scripts:** Rewrite restart_mcp_stack.sh to skip gateway
+5. **Verify file-based deps:** .env files, node_modules, dist/ bundles remain on disk — not served by gateway
+6. **Test each layer:** MCP SSE endpoints, PostgreSQL, Telegram bot API, AmoCRM stdio
+7. **Stop services, verify again, then disable**
+8. **Archive data:** Copy daily memory files to ~/.hermes/archive/
+
+**Key insight:** The `/root/.openclaw/workspace/` directory MUST NOT be deleted — MCP servers still run from it.
+
+---
+
 ## Architecture
 
 | Component | Port | Type | Tools |
 |-----------|------|------|-------|
-| openclaw-gateway | 18789 | Node.js router (2 cluster procs: master + worker) | — |
+| ~~openclaw-gateway~~ | ~~18789~~ | ~~STOPPED~~ | — |
 | Analytics MCP | 8101 (SSE) | FastMCP + uvicorn | 70 (69 OK + 1 fixed) |
 | wazzup24-mcp | 8102 (SSE) | FastMCP + uvicorn | 12 (all functional, 3 stubs) |
 | meta-ads-mcp | 8103 (SSE) | FastMCP | 31 |

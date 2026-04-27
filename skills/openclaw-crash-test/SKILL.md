@@ -1,31 +1,33 @@
 ---
 name: openclaw-crash-test
-description: Systematic crash-testing methodology for the OpenClaw CRM/analytics system (alef-med.com). Covers database integrity, business logic, infrastructure, and code review patterns.
-version: 1.0
+description: Systematic crash-testing methodology for the Hermes analytics/CRM system (alef-med.com). Covers database integrity, business logic, infrastructure, stress tests, and code review patterns. OpenClaw is DISABLED — all services run independently.
+version: 2.0
 ---
 
-# OpenClaw Crash-Test Methodology
+# Hermes Crash-Test & Test-Race Methodology
 
-## System Overview
+## System Overview (Post-OpenClaw)
 - PostgreSQL `analytics` DB on localhost:5432, user `analytics_user`
+- PGPASSWORD: `grep POSTGRES_PASSWORD /root/.openclaw/workspace/openclaw-mcp-servers/.env | cut -d= -f2`
 - Python venv: `/root/.openclaw/workspace/openclaw-mcp-servers/.venv/bin/python3`
-- Working dir: `/root/.openclaw/workspace/openclaw-mcp-servers`
-- PGPASSWORD from `.env` (`POSTGRES_PASSWORD`)
-- MCP servers: analytics(:8101), wazzup24(:8102), meta-ads(:8103), gateway(:18789)
+- MCP servers (independent systemd): analytics(:8101), wazzup24(:8102), meta-ads(:8103)
+- AmoCRM MCP: stdio mode (`node dist/index.js`)
 - AX2 dashboard: :8080, PHP cron at `/var/www/ax/ax2_cron.php`
-- Scripts: `sync_altegio.py`, `sync_amocrm.py`, `stale_leads_automation.py`, `daily_sync_with_notify.sh`
+- Hermes gateway: PID (via `hermes_cli.main gateway run --replace`)
+- Scripts: `daily_sync_with_notify.sh` (flock), `automation_watcher.sh`, `crawl_alefmed.py`, `stale_leads_automation.py` (PAUSED)
+- **OpenClaw gateway + claude-mem: DISABLED** — do not restart
 
 ## Test Categories
 
 ### 1. Database Integrity (ALWAYS START HERE)
 ```sql
--- Orphan records
-SELECT COUNT(*) FROM core.fact_appointment WHERE client_id IS NOT NULL AND client_id NOT IN (SELECT id FROM core.dim_client);
-SELECT COUNT(*) FROM core.fact_appointment WHERE service_id IS NOT NULL AND service_id NOT IN (SELECT id FROM core.dim_service);
+-- Orphan records (NOTE: walk-in client id=-1 is intentional, NOT an orphan)
 SELECT COUNT(*) FROM core.fact_appointment WHERE employee_id IS NOT NULL AND employee_id NOT IN (SELECT id FROM core.dim_employee);
-
--- NULL client_ids with revenue
-SELECT attendance_status, COUNT(*), SUM(amount) FROM core.fact_appointment WHERE client_id IS NULL AND amount > 0 GROUP BY attendance_status;
+SELECT COUNT(*) FROM core.fact_appointment WHERE service_id IS NOT NULL AND service_id NOT IN (SELECT id FROM core.dim_service);
+-- Client orphans (exclude walk-in id=-1 which is valid)
+SELECT COUNT(*) FROM core.fact_appointment WHERE client_id NOT IN (SELECT id FROM core.dim_client) AND client_id > 0;
+-- NULL client_ids (should be 0 — walk-ins use id=-1)
+SELECT COUNT(*) FROM core.fact_appointment WHERE client_id IS NULL;
 
 -- Duplicate snapshots
 SELECT COUNT(*) FROM mart.client_activity_snapshot WHERE monetary = total_paid;  -- Should DIFFER after fix
@@ -36,11 +38,48 @@ SELECT attendance_status, COUNT(*), SUM(amount) FROM core.fact_appointment GROUP
 -- Future dates
 SELECT COUNT(*) FROM core.fact_appointment WHERE created_at > CURRENT_DATE;
 
--- Identity map conflicts
-SELECT altegio_client_id, COUNT(*) FROM core.identity_map GROUP BY altegio_client_id HAVING COUNT(*) > 1;
+-- Identity map conflicts (correct table name is client_identity_map)
+SELECT altegio_client_id, COUNT(*) FROM core.client_identity_map WHERE altegio_client_id IS NOT NULL GROUP BY altegio_client_id HAVING COUNT(*) > 1;
+```
+
+### 1c. Stress Tests (run after integrity checks)
+```bash
+# MCP SSE endpoint rapid fire (5x each, all should return 200)
+for port in 8101 8102 8103; do
+  for i in $(seq 5); do
+    curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:$port/sse
+  done
+done
+
+# AmoCRM MCP stdio init test
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | timeout 10 node /root/.openclaw/workspace/openclaw-mcp-servers/amocrm-mcp-patched/dist/index.js
+
+# PostgreSQL connection limit
+SELECT setting FROM pg_settings WHERE name='max_connections';  -- Should be 100
+SELECT COUNT(*) FROM pg_stat_activity;  -- Should be well under 100
+
+# Check stale lock files (should be empty files from flock, not blocking)
+ls -la /tmp/*.lock  # Empty files are OK; files with content = stale mkdir lock
+```
+
+### 1d. Walk-in Client & Data Consistency (IMPORTANT)
+```sql
+-- Walk-in client sanity checks
+SELECT COUNT(*) FROM core.fact_appointment WHERE client_id IS NULL;  -- Must be 0 (all walk-ins → id=-1)
+SELECT COUNT(*) FROM core.fact_appointment WHERE client_id=-1;  -- Walk-in records
+SELECT COUNT(*) FROM mart.client_activity_snapshot WHERE client_id=-1;  -- Must be 0 (walk-in excluded from snapshot)
+SELECT COUNT(*) FROM core.dim_client WHERE id=-1;  -- Must be 1
+
+-- Phantom values (should be 0)
+SELECT COUNT(*) FROM mart.client_activity_snapshot WHERE monetary > 100000 OR total_paid > 100000;
+SELECT COUNT(*) FROM mart.client_activity_snapshot WHERE frequency=0 AND monetary > 0;
+
+-- Duplicate client_id in snapshot (must be 0)
+SELECT COUNT(*) FROM (SELECT client_id FROM mart.client_activity_snapshot GROUP BY client_id HAVING COUNT(*)>1) sub;
 ```
 
 ### 2. Business Logic Edge Cases
+- **Walk-in client**: id=-1 in dim_client holds orphan appointments. Analytics queries MUST filter `client_id > 0`.
 - `monetary` should use `COALESCE(cash_amount, amount)`, `total_paid` uses `amount`
 - `recency_days` should be `GREATEST(CURRENT_DATE - ..., 0)` — no negatives
 - `first_visit_date` = `MIN(all appointments)`, not just attended
@@ -49,12 +88,37 @@ SELECT altegio_client_id, COUNT(*) FROM core.identity_map GROUP BY altegio_clien
 - Segment CASE must handle NULL and negative recency_days: `WHEN recency_days IS NULL OR recency_days < 0 THEN 'prospect'`
 - Check: `SELECT COUNT(*) FROM mart.client_activity_snapshot WHERE total_paid != monetary` — should be > 0
 
-### 3. Infrastructure Checks
-- **nginx**: Check for public PHP files that shouldn't be accessible (`ax2_cron.php`, `ax2_load.php`)
+### 2b. Segment Distribution Sanity
+```sql
+-- Champion avg monetary should be high (>>100)
+SELECT segment, COUNT(*), round(AVG(monetary)::numeric) FROM mart.client_activity_snapshot GROUP BY segment ORDER BY count DESC;
+-- at_risk should NOT have frequency=0
+SELECT COUNT(*) FROM mart.client_activity_snapshot WHERE segment='at_risk' AND frequency=0;  -- Should be 0
+-- prospect should have monetary=0
+SELECT COUNT(*) FROM mart.client_activity_snapshot WHERE segment='prospect' AND monetary > 0;  -- Should be 0 or very low
+```
+
+### 2c. Retention Cohort Validation (catches the 100% bug)
+```sql
+-- M1 retention should be 30-60%, NOT 100%
+SELECT cohort_month, cohort_size, retention_rate FROM mart.retention_monthly WHERE period_offset=1 ORDER BY cohort_month DESC LIMIT 5;
+-- No impossible values
+SELECT COUNT(*) FROM mart.retention_monthly WHERE retention_rate > 1.0;  -- Must be 0
+SELECT COUNT(*) FROM mart.retention_monthly WHERE retention_rate < 0;    -- Must be 0
+SELECT COUNT(*) FROM mart.retention_monthly WHERE cohort_size = 0;      -- Must be 0
+```
+
+### 3. Infrastructure & Stress Tests
+- **nginx**: Check for public PHP files on port 8080 (`curl http://localhost:8080/ax2_cron.php` → should be 403)
 - **Locks**: Use `flock`, NOT `mkdir` for cron job locks (mkdir deadlocks on SIGKILL/OOM)
 - **Secrets**: No hardcoded tokens in shell scripts — use `source .env`
 - **429/5xx retry**: Separate retry budgets. 429 uses `Retry-After` header, doesn't consume 5xx attempts
 - **Crontab**: Check entries with `crontab -l`, verify schedules don't overlap
+- **MCP stress test**: Hit each MCP /sse endpoint 5x rapidly, verify all return 200
+- **Systemd restart policy**: All MCP services should have `Restart=always` + `RestartSec=10`
+- **MCP init test**: Pipe JSON-RPC `initialize` via stdio to verify AmoCRM MCP boots
+- **Hermes gateway process**: Verify `hermes_cli.main gateway run` is running
+- **UFW**: `ufw status` should show `active` with required ports (22,80,443,3001,8080,8090,8501)
 
 ### 4. PHP/AX2-Specific
 - `vcost()` uses `max(cost, manual_cost, first_cost)` — list price
@@ -108,12 +172,45 @@ After every code fix:
 
 ## Known Issues (already fixed, do NOT re-fix)
 - SQL injection: Do NOT fix, per user rule
-- `retention_monthly` cohort_sizes CTE: already fixed
+- `retention_monthly` cohort_sizes CTE: already fixed (was 100% → now M1 ~30-44%)
 - `fact_appointment.attendance_status`: use 'attended' NOT 'visited'
 - Retail data: fact_retail_sale=0 is correct (no retail module)
+- OpenClaw gateway disabled — MCP servers run independently via systemd
+- **fact_deal.client_id stores NEGATIVE amo_contact_id** (e.g. -48214713, NOT 48214713). All tools querying fact_deal MUST either: (a) negate IDs in Python [-int(x) for x in amo_ids], or (b) use ABS(fd.client_id) in SQL JOINs
+
+## Fixed Issues (Apr 27 session 1 — do NOT re-fix)
+- ✅ 11 orphan employee_id=2891230 → SET employee_id=NULL
+- ✅ 1823 NULL client_id → walk-in client id=-1 in dim_client + fact_appointment
+- ✅ sync_altegio.py: COALESCE(client_id, -1) in INSERT/UPDATE, client_id > 0 in 5 WHERE clauses
+- ✅ crawl_alefmed.py: added fcntl.flock guard (/tmp/crawl_alefmed.lock)
+- ✅ stale_leads_automation.py: added fcntl.flock guard (/tmp/stale_leads.lock)
+- ✅ client_ranking.py, secondary_services.py: client_id > 0 filter (3+1 queries)
+- Stale /tmp/*.lock files: harmless — flock is process-bound, not file-existence-bound
+
+## Fixed Issues (Apr 27 session 2 — do NOT re-fix)
+- ✅ RFM recomputation: added daily DELETE+INSERT in sync_altegio.py (was stale since Apr 17)
+- ✅ revenue_daily: switched from amount to cash_amount; added client_id>0 filter; DELETE all rows on sync
+- ✅ finance_summary: switched from amount to cash_amount; added client_id>0 filter
+- ✅ client_id>0 filter added to ALL 14 MCP tools (was only in 3)
+- ✅ client_intent_snapshot: JOIN changed from cim.amo_contact_id=fd.client_id to ABS(fd.client_id)
+- ✅ conversation_ai: fd.client_id IN clause now uses negated IDs [-int(x) for x in amo_ids]
+- ✅ conversations.py: validated_ids now negated [-int(x) for x in amo_ids]
+- ✅ reactivation_orch.py: deal_filter builder now negates amo_ids
+- ✅ revenue_daily: 4 ghost rows (dates with only confirmed visits) cleaned up
 
 ## Cron Job
 - Crash-test cronjob ID: `4bdc94c3a152`
 - Model rotation: glm-5.1 / kimi-k2.6:cloud (alternates daily)
 - Rotation script: `/root/.openclaw/workspace/scripts/rotate_crash_test_model.py`
 - State file: `/root/.hermes/cron/crash_test_state.json`
+- ЗАВИСШИЕ cron: PAUSED (commented out with `# PAUSED:` prefix in crontab)
+- All notifications via @shostka_help_bot (NOT @anastasialeadbot which is disabled)
+
+## Quick pq() Helper for Crash Tests
+```python
+from hermes_tools import terminal
+pwd = terminal(command="grep POSTGRES_PASSWORD /root/.openclaw/workspace/openclaw-mcp-servers/.env | cut -d= -f2")["output"].strip()
+def pq(sql):
+    return terminal(command=f"PGPASSWORD='{pwd}' psql -h localhost -U analytics_user -d analytics -t -c \"{sql}\" 2>&1")['output'].strip().replace('\n','')
+```
+NOTE: Cannot use `bash -c 'source .env && psql'` — PGPASSWORD must be explicitly exported. Use `PGPASSWORD='$pwd' psql` pattern instead.

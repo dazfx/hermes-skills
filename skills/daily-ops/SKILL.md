@@ -37,8 +37,10 @@ Suite of cron-driven scripts handling daily synchronization, reporting, crawling
 
 ### 2. Daily Report (`daily_report.sh`)
 - **Cron**: 08:00 UTC daily
+- **Log**: `/root/.openclaw/workspace/logs/daily_report.log`
 - **Purpose**: Generates and delivers daily analytics report
 - **Note**: Depends on data synced by the previous day's sync
+- **Crontab entry**: `0 8 * * * /root/.openclaw/workspace/scripts/daily_report.sh >> /root/.openclaw/workspace/logs/daily_report.log 2>&1`
 
 ### 3. Alefmed Crawler (`crawl_alefmed.py`)
 - **Cron**: 04:00 UTC daily
@@ -104,3 +106,5 @@ crontab -l
 - Model rotation only works for glm-5.1 ↔ kimi-k2.6 — adding a third model requires code changes
 - automation_watcher.sh cannot recover itself if it dies — consider a separate systemd timer as backup
 - All times are UTC — verify server timezone matches expectations
+- **Cron job logging**: every cron job MUST redirect output to a log file (`>> /path/to/log 2>&1`). Jobs without log redirection silently lose their output — check `crontab -l` for entries missing `>>` and fix them.
+- **Scripts source .env**: daily_report.sh and task_watchdog.sh need `source /root/.openclaw/workspace/openclaw-mcp-servers/.env` for TELEGRAM_BOT_TOKEN — if Telegram notifications silently fail, check the .env path in each script
