@@ -170,6 +170,62 @@ After every code fix:
 2. Check the specific file with `php -l` or Python syntax check
 3. For DB fixes: `DELETE`/`UPDATE` bad data, then verify with `SELECT`
 
+## Round 4 Crash-Test Results (Apr 27 2026) — 45 tests, 29 PASS, 8 WARN, 3 FAIL
+
+### NEW BUGS FOUND
+1. **revenue_daily/finance_summary STALE after code fix** — v77b0367 used `fa.amount` (list price) for service_revenue instead of `fa.cash_amount`. Fix deployed in c8b30f5 but mart tables kept stale data (€287K) until manually refreshed. **FIX APPLIED**: manually ran DELETE+INSERT for revenue_daily and finance_summary. Now shows €188,179.82. **PREVENTION**: always refresh marts after code changes to sync scripts, or add a post-deploy hook.
+2. **raw.amo_events=0 rows** — table exists in schema but is NEVER populated by any script. sync_amocrm.py writes to raw.amo_events_raw only. **NOT A BUG**: all MCP tools (conversations.py, client_ranking.py, etc.) correctly query raw.amo_events_raw (373K rows). raw.amo_events is a dead schema artifact.
+3. **77 duplicate transaction pairs** in core.fact_client_account_transaction — same client+type+amount+date with consecutive Altegio IDs. These are REAL separate entries (e.g., service_payment + deposit deduction for same visit), NOT data corruption. ON CONFLICT (id) dedup works correctly.
+
+### NEW TEST CASES (Round 4+)
+```sql
+-- T1: Data freshness — check last sync per table
+SELECT 'fact_appointment' as tbl, COUNT(*) cnt, MAX(created_at)::date FROM core.fact_appointment
+UNION ALL SELECT 'fact_client_account_transaction', COUNT(*), MAX(created_at)::date FROM core.fact_client_account_transaction
+UNION ALL SELECT 'fact_deal', COUNT(*), MAX(created_at)::date FROM core.fact_deal;
+
+-- T2: Transaction integrity — no negative amounts, no orphan client_ids
+SELECT COUNT(*) FROM core.fact_client_account_transaction WHERE amount < 0;
+SELECT COUNT(*) FROM core.fact_client_account_transaction t LEFT JOIN core.dim_client c ON c.id=t.client_id WHERE c.id IS NULL AND t.client_id > 0;
+
+-- T4: LTV view integrity — no negative revenue, no walk-in
+SELECT COUNT(*) FROM mart.client_ltv_real WHERE cash_revenue < 0;
+SELECT COUNT(*) FROM mart.client_ltv_real WHERE client_id <= 0;
+
+-- T5: fact_deal cross-check — client_id must be negative (amo convention)
+SELECT COUNT(*) FROM core.fact_deal WHERE client_id > 0 AND client_id IS NOT NULL;  -- Should be 0
+
+-- T12: Revenue cross-validation — critical consistency check
+SELECT ROUND(SUM(service_revenue),2) FROM mart.revenue_daily;     -- Must equal...
+SELECT ROUND(SUM(service_revenue),2) FROM mart.finance_summary;   -- ...this
+SELECT ROUND(SUM(cash_revenue),2) FROM mart.client_ltv_real;      -- Close (may differ by ~€2K due to COALESCE)
+
+-- T15: Future dates — confirmed bookings OK, attended = BUG
+SELECT COUNT(*) FROM core.fact_appointment WHERE created_at > CURRENT_DATE AND attendance_status='attended';  -- Must be 0
+
+-- T17: Duplicate records — same client+service+date (may be legitimate multi-session)
+SELECT COUNT(*) FROM (SELECT client_id, service_id, created_at::date FROM core.fact_appointment WHERE client_id > 0 GROUP BY 1,2,3 HAVING COUNT(*)>1) sub;
+
+-- T40: Client count cross-check
+SELECT COUNT(*) FROM core.dim_client WHERE id > 0;        -- All clients
+SELECT COUNT(DISTINCT client_id) FROM core.fact_appointment WHERE client_id > 0;  -- Active clients
+SELECT COUNT(*) FROM mart.client_activity_snapshot;        -- Should match active
+SELECT COUNT(*) FROM mart.client_ltv_real;                 -- Should be close to dim_client count
+```
+
+### POST-CODE-FIX MART REFRESH PROCEDURE
+After any change to sync_altegio.py that affects mart queries:
+1. Run sync: `cd /root/.openclaw/workspace/openclaw-mcp-servers && .venv/bin/python3 scripts/sync_altegio.py`
+2. If can't wait for sync, manually refresh affected tables:
+```sql
+DELETE FROM mart.revenue_daily;
+-- Re-run INSERT from sync_altegio.py revenue_daily section
+DELETE FROM mart.finance_summary;
+-- Re-run INSERT from sync_altegio.py finance_summary section
+REFRESH MATERIALIZED VIEW CONCURRENTLY mart.client_ltv_real;
+```
+3. Verify: `SELECT ROUND(SUM(service_revenue),2) FROM mart.revenue_daily` must equal `SELECT ROUND(SUM(cash_amount),2) FROM core.fact_appointment WHERE attendance_status='attended' AND client_id > 0 AND amount > 0 AND created_at <= CURRENT_DATE`
+
 ## Known Issues (already fixed, do NOT re-fix)
 - SQL injection: Do NOT fix, per user rule
 - `retention_monthly` cohort_sizes CTE: already fixed (was 100% → now M1 ~30-44%)
@@ -177,6 +233,7 @@ After every code fix:
 - Retail data: fact_retail_sale=0 is correct (no retail module)
 - OpenClaw gateway disabled — MCP servers run independently via systemd
 - **fact_deal.client_id stores NEGATIVE amo_contact_id** (e.g. -48214713, NOT 48214713). All tools querying fact_deal MUST either: (a) negate IDs in Python [-int(x) for x in amo_ids], or (b) use ABS(fd.client_id) in SQL JOINs
+- revenue_daily stale after code fix — manually refreshed Apr 27. Next sync will use corrected code automatically
 
 ## Fixed Issues (Apr 27 session 1 — do NOT re-fix)
 - ✅ 11 orphan employee_id=2891230 → SET employee_id=NULL
