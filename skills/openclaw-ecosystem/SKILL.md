@@ -1,7 +1,8 @@
 ---
 name: openclaw-ecosystem
-description: OpenClaw MCP ecosystem audit, crash-testing, and maintenance. Covers analytics-mcp, wazzup24-mcp, meta-ads-mcp, amocrm-mcp, context7, and the gateway.
-version: 1.0
+description: Legacy system reference — OpenClaw gateway DISABLED (Apr 27). All functionality migrated to Hermes Agent. MCP servers run as independent systemd services. Use hermes-ecosystem instead.
+version: 3.0
+deprecated: true
 ---
 
 # OpenClaw Ecosystem — Audit & Maintenance
