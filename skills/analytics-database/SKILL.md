@@ -238,7 +238,13 @@ WHERE state = 'active'
 ORDER BY query_start;
 ```
 
-### 7. Walk-in client `client_id = -1`
+### 7. Dimension table column names differ from fact tables
+- `dim_service` uses `id` (not `service_id`), `name` (not `service_name`), `category`, `price_min`, `duration`
+- `dim_client` uses `id` (not `client_id` in joins), `name`, `phone`, `first_visit_date`, `created_at`
+- When JOINing: `FROM core.fact_appointment fa JOIN core.dim_service ds ON ds.id = fa.service_id`
+- NOT: `ON ds.service_id = fa.service_id` (this column doesn't exist in dim_service)
+
+### 8. Walk-in client `client_id = -1`
 1,823 appointments had NULL client_id from Altegio. These were assigned a placeholder `dim_client` row with `client_id = -1` ("Walk-in Client"). **ALL analytics queries MUST filter `WHERE client_id > 0`** to exclude walk-in clients from client-level metrics while keeping their revenue in aggregate totals.
 
 ### 8. `fact_deal` — 1,718 deals with NULL client_id
@@ -249,6 +255,69 @@ ORDER BY query_start;
 
 ### 10. `revenue_daily` / `finance_summary` — use `cash_amount`
 Both tables were fixed to use `cash_amount` instead of `amount` (was 2.86x inflated). Both also filter `client_id > 0`. `new_clients`/`repeat_clients` columns are now populated.
+
+## Primary/Secondary Visit Classification & Revenue by Cohort
+
+A "primary" (первичная) visit is the first qualifying visit for a client — first visit with `cash_amount > 0` that is NOT solely diagnostic. If ALL visits are diagnostic, use the first one. All subsequent visits are "secondary" (вторичная).
+
+### Diagnostic keywords (skip these as primary)
+`diagnóstico`, `diagnostico`, `диагностика`, `консультац`, `primera consulta`, `diagnostico facial`
+
+### Revenue sources (DO double-count across sources)
+- **Appointments**: `fact_appointment.cash_amount` WHERE `attendance_status='attended'` AND `cash_amount > 0`
+- **Deposits (абонименты)**: `fact_client_account_transaction` WHERE `type='deposit'` AND `amount > 0`
+- **Retail (косметика)**: `fact_client_account_transaction` WHERE `type='retail'` AND `amount > 0`
+
+### Revenue source to EXCLUDE
+- **`service_payment`**: This is paying for a service FROM deposit — NOT new revenue. Already counted when deposit was made.
+
+### Template SQL: Primary visit classification
+```sql
+WITH qualifying_visits AS (
+  SELECT fa.client_id, fa.service_id, fa.cash_amount, fa.created_at, ds.name as service_name,
+    CASE WHEN ds.name ILIKE '%diagnos%' OR ds.name ILIKE '%consulta%' OR ds.name ILIKE '%primera consulta%'
+      THEN TRUE ELSE FALSE END as is_diagnostic,
+    CASE WHEN ds.name ILIKE '%ipl%' THEN TRUE ELSE FALSE END as is_ipl
+  FROM core.fact_appointment fa
+  JOIN core.dim_service ds ON ds.id = fa.service_id
+  WHERE fa.attendance_status = 'attended' AND fa.client_id > 0 AND fa.cash_amount > 0
+),
+first_non_diag AS (
+  SELECT DISTINCT ON (client_id) client_id, service_id, service_name, cash_amount, created_at, is_ipl
+  FROM qualifying_visits WHERE is_diagnostic = FALSE ORDER BY client_id, created_at
+),
+first_any AS (
+  SELECT DISTINCT ON (client_id) client_id, service_id, service_name, cash_amount, created_at, is_ipl
+  FROM qualifying_visits ORDER BY client_id, created_at
+),
+client_first AS (
+  SELECT COALESCE(fq.client_id, fa.client_id) as client_id,
+         COALESCE(fq.service_name, fa.service_name) as first_service,
+         COALESCE(fq.is_ipl, fa.is_ipl) as first_is_ipl,
+         COALESCE(fq.cash_amount, fa.cash_amount) as first_cash,
+         COALESCE(fq.created_at, fa.created_at) as first_date
+  FROM first_non_diag fq FULL OUTER JOIN first_any fa USING (client_id)
+)
+-- Use client_first as a temp table, JOIN with fact_appointment for recent visits
+-- Classify: if visit = first_date AND service = first_service → primary, else → secondary
+```
+
+### Total Revenue per Cohort (30 days)
+```sql
+-- Appointments revenue
+SELECT 'IPL' as cohort,
+  ROUND(SUM(fa.cash_amount), 2) as appt_rev,
+  COUNT(*) as visits,
+  COUNT(DISTINCT fa.client_id) as clients
+FROM core.fact_appointment fa
+JOIN client_first cfv ON cfv.client_id = fa.client_id
+WHERE fa.attendance_status='attended' AND fa.client_id > 0 AND fa.cash_amount > 0
+  AND fa.created_at >= NOW() - INTERVAL '30 days' AND cfv.first_is_ipl = TRUE;
+
+-- Deposit revenue (same JOIN, type='deposit')
+-- Retail revenue (same JOIN, type='retail')
+-- Total = cash_amount sum + deposit sum + retail sum
+```
 
 ## Systematic Bug-Hunting Methodology
 
