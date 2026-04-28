@@ -10,10 +10,10 @@ version: 1.0
 Two monitoring scripts that keep the system healthy: `automation_watcher.sh` (comprehensive health checker + auto-repair) and `task_watchdog.sh` (cron task freshness monitor).
 
 ## File Locations
-- `automation_watcher.sh`: `/root/.openclaw/workspace/scripts/automation_watcher.sh` (303 lines)
-- `task_watchdog.sh`: `/root/.openclaw/workspace/scripts/task_watchdog.sh` (75 lines)
-- Logs: `/root/.openclaw/workspace/logs/`
-- Repairs log: `/root/.openclaw/workspace/logs/repairs.log`
+- `automation_watcher.sh`: `~/.hermes/scripts/automation_watcher.sh`
+- `task_watchdog.sh`: `~/.hermes/scripts/task_watchdog.sh`
+- Logs: `/var/log/`
+- Repairs log: `/var/log/repairs.log`
 
 ## Cron Schedule
 - Watcher: `*/15 * * * *` (every 15 min)
@@ -42,9 +42,10 @@ Two monitoring scripts that keep the system healthy: `automation_watcher.sh` (co
 
 ### Key Config
 ```bash
-WORKSPACE="/root/.openclaw/workspace/openclaw-mcp-servers"
-SCRIPTS_DIR="/root/.openclaw/workspace/scripts"
-TELEGRAM_CHAT_ID="215708742"  # Alexey
+SCRIPTS_DIR="/root/.hermes/scripts"
+CHAT_ID="215708742"  # Alexey
+# Source Hermes .env for all tokens (NOT OpenClaw workspace!)
+source /root/.hermes/.env
 ```
 
 ### Notification
@@ -83,7 +84,8 @@ Includes dedup logic — won't spam about same issue repeatedly.
 3. Test: `curl -s "https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=215708742&text=test"`
 
 ## Pitfalls
-- Watcher uses HERMES bot token, NOT the old OpenClaw bot token
+- **CRITICAL: Watcher uses Hermes .env** — scripts source `/root/.hermes/.env`. If env vars like `POSTGRES_PASSWORD` or `AMOCRM_ACCESS_TOKEN` are missing, watcher can't connect to services and will falsely restart them every cycle (e.g. PostgreSQL restart loop every 15 min). Always verify `source /root/.hermes/.env` exports all needed vars.
+- Watcher uses ANASASIA_BOT_TOKEN for notifications (with fallback to TELEGRAM_BOT_TOKEN)
 - 5-minute cooldown prevents restart loops but won't help if service crashes every 6 min
 - Swap warnings occur frequently if memory is tight — consider adding swap or reducing services
 - FileBrowser at :8090 is NOT checked by watcher (add if needed)

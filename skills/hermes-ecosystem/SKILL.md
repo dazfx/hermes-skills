@@ -53,5 +53,18 @@ category: devops
 
 ## OpenClaw → Hermes Migration
 OpenClaw gateway + claude-mem are STOPPED and DISABLED since Apr 27.
-All cron jobs now reference `~/.hermes/` paths (symlinks to OpenClaw workspace).
-Bot @anastasialeadbot is dead. Use @shostka_help_bot.
+All cron jobs now reference `~/.hermes/` paths (no more symlinks to OpenClaw workspace).
+All secrets are centralized in `/root/.hermes/.env`.
+Bot @anastasialeadbot = notifications channel (no AI). Bot @shostka_help_bot = main Hermes.
+
+## Environment (.env) Variables
+All in `/root/.hermes/.env`:
+- `TELEGRAM_BOT_TOKEN` — @shostka_help_bot
+- `ANASTASIA_BOT_TOKEN` — @anastasialeadbot (notifications)
+- `POSTGRES_PASSWORD` — analytics DB
+- `AMOCRM_ACCESS_TOKEN` — amoCRM API
+- `ALTEGIO_API_TOKEN` — Altegio ETL sync
+- `WAZZUP24_API_KEY` — Wazzup24 API
+- `META_*` — Meta Ads tokens (4 accounts)
+
+⚠️ All scripts MUST source `/root/.hermes/.env` — missing env vars cause false alarm loops (e.g. watcher restarting PostgreSQL).
